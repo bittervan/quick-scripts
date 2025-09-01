@@ -125,4 +125,3 @@ sleep "$SPAWN_WAIT"
 # 再次切换（此时应能命中并激活）
 log "再次尝试切换……"
 run_kwin_toggle || true
-
