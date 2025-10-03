@@ -19,21 +19,56 @@ class PaperSize:
 
 def normalize_to_a4(page: PageObject) -> PageObject:
     """
-    将任意大小的 page 规范化为 A4：
-    - 比 A4 大：不缩放，居中放置到 A4 画布上，超出部分被 A4 裁切掉
-    - 比 A4 小：不缩放，居中放置到 A4 画布上（四周留白）
+    将任意大小/坐标系/旋转的 page 规范化为 A4：
+    - 尊重原始 mediabox 的 left/bottom 偏移
+    - 应用 /Rotate（90/180/270）后再做几何对齐
+    - 不缩放：大于 A4 的部分被裁切（中心裁切）；小于 A4 则居中垫白
     """
     a4w, a4h = float(PaperSize.A4.width), float(PaperSize.A4.height)
-    pw, ph = float(page.mediabox.width), float(page.mediabox.height)
 
+    mb = page.mediabox
+    llx, lly = float(mb.left), float(mb.bottom)
+    pw, ph   = float(mb.width), float(mb.height)
+
+    # 取 /Rotate；pypdf 通常提供 page.rotation（可能为 None）
+    rot = getattr(page, "rotation", 0) or 0
+    rot = int(rot) % 360
+    if rot not in (0, 90, 180, 270):
+        # 非 90 的倍数基本很少见，这里保守归零
+        rot = 0
+
+    # 旋转后的“可视宽高”
+    if rot in (0, 180):
+        rw, rh = pw, ph
+    else:
+        rw, rh = ph, pw
+
+    # 目标：A4 空白画布
     dst = PageObject.create_blank_page(width=a4w, height=a4h)
 
-    dx = (a4w - pw) / 2.0
-    dy = (a4h - ph) / 2.0
-    t = Transformation().translate(dx, dy)
+    # 基础：把原页面移到 (0,0)（消除 mediabox 偏移）
+    T = Transformation().translate(-llx, -lly)
 
-    # 把原页“绘制”到 A4；超出 A4 的部分被裁掉
-    dst.merge_transformed_page(page, t)
+    # 应用 /Rotate，并把旋转后的内容“复位”到左下为 (0,0)（保证后续居中位移可用）
+    if rot == 90:
+        # (x,y)->(-y,x), bounds: x'∈[-ph,0], y'∈[0,pw] => 平移 (ph, 0)
+        T = T.rotate(90).translate(ph, 0)
+    elif rot == 180:
+        # (x,y)->(-x,-y), bounds: x'∈[-pw,0], y'∈[-ph,0] => 平移 (pw, ph)
+        T = T.rotate(180).translate(pw, ph)
+    elif rot == 270:
+        # (x,y)->(y,-x), bounds: x'∈[0,ph], y'∈[-pw,0] => 平移 (0, pw)
+        T = T.rotate(270).translate(0, pw)
+    # rot == 0: 不动
+
+    # 现在旋转/复位后，内容左下角就是 (0,0)，尺寸 (rw, rh)
+    # 居中放到 A4：中心对中心（真正对称）
+    dx = (a4w - rw) / 2.0
+    dy = (a4h - rh) / 2.0
+    T = T.translate(dx, dy)
+
+    # 把经过上述几何处理的原页“绘制”到 A4；超出 A4 的部分自然被裁掉
+    dst.merge_transformed_page(page, T)
     return dst
 
 
@@ -47,7 +82,6 @@ def compute_groups(total_pages: int, user_booklet_pages: Optional[int]) -> List[
     if user_booklet_pages is not None:
         if user_booklet_pages % 4 != 0:
             raise ValueError("Number of booklet pages must be a multiple of 4")
-        # 注意：为了覆盖全部页，最后一组可能不满，仍按指定册数补齐
         num_groups = (total_pages + user_booklet_pages - 1) // user_booklet_pages
         return [user_booklet_pages] * num_groups
 
@@ -63,72 +97,65 @@ def compute_groups(total_pages: int, user_booklet_pages: Optional[int]) -> List[
         groups.append(last_group_size)
     return groups
 
-
 def add_booklet(writer: PdfWriter,
-                a4_pages: List[PageObject],
+                a4_pages: list[PageObject],
                 anti_bleed_inch: float = 0.14) -> None:
     """
-    将 A4 页列表拼成 A3 横向对折小册子，并整体“放大一点”，抵消打印出血。
-    - a4_pages: 已经规范为 A4 的页面（数量必须为 4 的倍数）
-    - anti_bleed_inch: 期望抵消的“出血”宽度（英寸）。例如 Okular 默认 0.14 inch。
-      原理：把整张 A3 画布内容按比例放大到可覆盖上下左右各 anti_bleed 的额外区域，
-           然后整体向外平移（负方向），让内容“伸出页面边界”进入出血区。
+    将 A4 页列表拼成 A3 横向对折小册子，并“绕页面中心”放大，来对称抵消打印出血。
     """
     num_pages = len(a4_pages)
     assert num_pages % 4 == 0, "booklet 组的页数必须是 4 的倍数"
 
     A4W = float(PaperSize.A4.width)
-    A4H = float(PaperSize.A4.height)
+    A3W = float(PaperSize.A3.height)   # 横向宽
+    A3H = float(PaperSize.A3.width)    # 横向高
 
-    # A3 横向尺寸：宽= A3 高；高= A3 宽
-    A3W = float(PaperSize.A3.height)   # 1190.551
-    A3H = float(PaperSize.A3.width)    # 841.890
-
-    LEFT_ORIGIN = (0.0, 0.0)     # 左页左下角
-    RIGHT_ORIGIN = (A4W, 0.0)    # 右页左下角
+    LEFT_ORIGIN  = (0.0, 0.0)
+    RIGHT_ORIGIN = (A4W, 0.0)
 
     bleed_pt = anti_bleed_inch * 72.0
 
-    # 计算“放大比例”：
-    # 想要内容覆盖 [0 - bleed_pt, W + bleed_pt] × [0 - bleed_pt, H + bleed_pt]
-    # 令缩放后有效尺寸为 s*W、s*H，并整体平移 (-bleed_pt, -bleed_pt)
-    # s_x 需满足：s*W >= W + 2*bleed_pt => s >= 1 + 2*bleed_pt/W
-    # s_y 同理；为保持等比，取 s = max(s_x, s_y)
+    # 目标：放大后，内容比 A3 四边各多出 bleed_pt
+    # s_x = 1 + 2*bleed/A3W, s_y = 1 + 2*bleed/A3H，取等比 s=max(...)
     sx = 1.0 + (2.0 * bleed_pt / A3W)
     sy = 1.0 + (2.0 * bleed_pt / A3H)
     s = max(sx, sy)
 
-    # 放大后，把原点平移到 (-bleed_pt, -bleed_pt)，保证四边都溢出到出血区
-    # 注意 pypdf 的组合变换是“先做前面的，后做后面的”，所以我们做：
-    # scale(s) -> translate(-bleed_pt, -bleed_pt)
-    # 结果是：x' = s*x - bleed_pt, y' = s*y - bleed_pt
-    post_scale_translate = Transformation().scale(s).translate(-bleed_pt, -bleed_pt)
+    # 关键：绕页面中心缩放 => 先把坐标系移到中心，再 scale，再移回去
+    cx, cy = A3W / 2.0, A3H / 2.0
+    center_scale = (
+        Transformation()
+        .translate(-cx, -cy)   # 把原点移到页面中心
+        .scale(s)              # 围绕中心放大
+        .translate(cx, cy)     # 移回
+    )
+    # 注意：这里不再做 (-bleed, -bleed) 的额外平移，中心缩放已经保证四边等量外溢
 
     for i in range(num_pages // 2):
-        # 先在“基底”A3 页上按原始未放大尺寸摆好左右两页
+        # 基底 A3：先按原尺寸摆好左右两页
         base = PageObject.create_blank_page(width=A3W, height=A3H)
 
         if i % 2 == 0:
-            left_page = a4_pages[num_pages - 1 - i]
+            left_page  = a4_pages[num_pages - 1 - i]
             right_page = a4_pages[i]
         else:
-            left_page = a4_pages[i]
+            left_page  = a4_pages[i]
             right_page = a4_pages[num_pages - 1 - i]
 
         base.merge_transformed_page(left_page,  Transformation().translate(*LEFT_ORIGIN))
         base.merge_transformed_page(right_page, Transformation().translate(*RIGHT_ORIGIN))
 
-        # 真正写入的 A3 页面：把“基底”整体放大，并负向平移以占满出血区
+        # 真正写入的 A3 页面：绕中心等比放大（对称抵消出血）
         canvas = writer.add_blank_page(width=A3W, height=A3H)
-        canvas.merge_transformed_page(base, post_scale_translate)
+        canvas.merge_transformed_page(base, center_scale)
 
 
 def parse_args(argv: List[str]):
     """
-    简单参数解析：
-    - argv[1]: 输入 PDF 路径（必填）
-    - 可选：一个纯数字，表示每册页数（必须是 4 的倍数）
-    - 可选：--anti-bleed=<inches> 例如 --anti-bleed=0.14
+    参数：
+      <input.pdf>（必填）
+      [booklet_pages]（可选；4 的倍数）
+      [--anti-bleed=0.14]（可选；单位英寸）
     """
     if len(argv) < 2:
         print("Usage: python booklet.py <input.pdf> [booklet_pages] [--anti-bleed=0.14]")
@@ -156,15 +183,15 @@ def main():
     reader = PdfReader(filename)
     total_pages = len(reader.pages)
 
-    # 1) 先把所有页面规范化为 A4
+    # 1) 规范化为 A4（中心裁切/垫白 + 正确处理 mediabox 偏移与 /Rotate）
     normalized_a4_pages: List[PageObject] = [normalize_to_a4(p) for p in reader.pages]
 
-    # 2) 放入“扩展器”，便于后续分组补空白页
+    # 2) 放入扩展器，便于分组补空白
     extender = PdfWriter()
     for p in normalized_a4_pages:
         extender.add_page(p)
 
-    # 3) 计算分组，并在每组末尾补足到 4 的倍数（空白 A4）
+    # 3) 计算分组并补足到 4 的倍数（空白 A4）
     groups = compute_groups(total_pages, booklet_pages)
     a4w, a4h = float(PaperSize.A4.width), float(PaperSize.A4.height)
 
@@ -176,7 +203,7 @@ def main():
             have += 1
         page_cursor += gsize
 
-    # 4) 逐组拼成 A3 横向对折小册子，并对整张 A3 画面做“放大+负向平移”以抵消出血
+    # 4) 逐组拼为 A3 横向小册子，并做“放大抵消出血”
     writer = PdfWriter()
     cursor = 0
     for gsize in groups:
@@ -184,7 +211,7 @@ def main():
         add_booklet(writer, group_slice, anti_bleed_inch=anti_bleed_inch)
         cursor += gsize
 
-    # 5) 输出文件
+    # 5) 输出
     base, ext = os.path.splitext(filename)
     outname = f"{base}-booklet.pdf"
     with open(outname, "wb") as fp:
